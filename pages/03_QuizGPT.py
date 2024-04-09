@@ -1,76 +1,38 @@
 import json
-import streamlit as st
-from langchain.retrievers import WikipediaRetriever
+from langchain.document_loaders import UnstructuredFileLoader
+from langchain.text_splitter import CharacterTextSplitter
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.callbacks import StreamingStdOutCallbackHandler
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.document_loaders import UnstructuredFileLoader
-from langchain.schema import BaseOutputParser
-
-class JsonOutputParser(BaseOutputParser):  
+import streamlit as st
+from langchain.retrievers import WikipediaRetriever
+from langchain.schema import BaseOutputParser, output_parser
+class JsonOutputParser(BaseOutputParser):
     def parse(self, text):
         text = text.replace("```", "").replace("json", "")
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            st.error("Failed to parse JSON from the model's response.")
-            return {}
-
+        return json.loads(text)
 output_parser = JsonOutputParser()
-
 st.set_page_config(
     page_title="QuizGPT",
     page_icon="❓",
 )
-
 st.title("QuizGPT")
-
 llm = ChatOpenAI(
     temperature=0.1,
     model="gpt-3.5-turbo-1106",
     streaming=True,
     callbacks=[StreamingStdOutCallbackHandler()],
 )
-
-def format_docs(docs, difficulty):
-    # Adjust the context based on difficulty
-    num_questions = 5 if difficulty == "Easy" else 10 if difficulty == "Medium" else 15
-    context_length = difficulty_levels[difficulty]
-    return "\n\n".join(document.page_content[:context_length] for document in docs[:num_questions])
-
-difficulty_levels = {
-    "Easy": 300,
-    "Medium": 600,
-    "Hard": 900,
-}
-
-@st.cache_data(show_spinner="Loading file...")
-def split_file(file, difficulty):
-    file_content = file.read()
-    chunk_size = difficulty_levels[difficulty]
-    file_path = f"./.cache/quiz_files/{file.name}"
-    with open(file_path, "wb") as f:
-        f.write(file_content)
-    splitter = CharacterTextSplitter.from_tiktoken_encoder(
-        separator="\n",
-        chunk_size=chunk_size,
-        chunk_overlap=100,
-    )
-    loader = UnstructuredFileLoader(file_path)
-    docs = loader.load_and_split(text_splitter=splitter)
-    return docs
-
-
-def get_prompt_template(difficulty):
-    context_length = difficulty_levels[difficulty]
-    return ChatPromptTemplate.from_messages([
+def format_docs(docs):
+    return "\n\n".join(document.page_content for document in docs)
+questions_prompt = ChatPromptTemplate.from_messages(
+    [
         (
-                "system",
-                f"""
+            "system",
+            """
     You are a helpful assistant that is role playing as a teacher.
          
-    Based ONLY on the following context (up to {context_length} characters), make questions to test the user's knowledge about the text.
+    Based ONLY on the following context make 10 (TEN) questions to test the user's knowledge about the text.
     
     Each question should have 4 answers, three of them must be incorrect and one should be correct.
          
@@ -92,13 +54,15 @@ def get_prompt_template(difficulty):
          
     Your turn!
          
-    Context: {{context}}
+    Context: {context}
 """,
-            )
-    ])
-
-formatting_prompt = ChatPromptTemplate.from_messages([
-    (
+        )
+    ]
+)
+questions_chain = {"context": format_docs} | questions_prompt | llm
+formatting_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
             "system",
             """
     You are a powerful formatting algorithm.
@@ -142,7 +106,7 @@ formatting_prompt = ChatPromptTemplate.from_messages([
                         {{
                             "answer": "Blue",
                             "correct": true
-                        }},
+                        }}
                 ]
             }},
                         {{
@@ -163,7 +127,7 @@ formatting_prompt = ChatPromptTemplate.from_messages([
                         {{
                             "answer": "Beirut",
                             "correct": false
-                        }},
+                        }}
                 ]
             }},
                         {{
@@ -184,7 +148,7 @@ formatting_prompt = ChatPromptTemplate.from_messages([
                         {{
                             "answer": "1998",
                             "correct": false
-                        }},
+                        }}
                 ]
             }},
             {{
@@ -205,7 +169,7 @@ formatting_prompt = ChatPromptTemplate.from_messages([
                         {{
                             "answer": "Model",
                             "correct": false
-                        }},
+                        }}
                 ]
             }}
         ]
@@ -215,65 +179,74 @@ formatting_prompt = ChatPromptTemplate.from_messages([
     Questions: {context}
 """,
         )
-])
-
+    ]
+)
 formatting_chain = formatting_prompt | llm
-
-
-@st.cache_data(show_spinner="Making quiz....")
-def run_quiz_chain(_docs, difficulty, topic):
-    if not _docs:
-        st.error("No documents available to generate questions.")
-        return {'questions': []}
-        
-    questions_prompt = get_prompt_template(difficulty)
-    questions_chain = {"context": (lambda docs: format_docs(docs, difficulty))} | questions_prompt | llm
-    formatting_chain = formatting_prompt | llm
+@st.cache_data(show_spinner="Loading file...")
+def split_file(file):
+    file_content = file.read()
+    file_path = f"./.cache/quiz_files/{file.name}"
+    with open(file_path, "wb") as f:
+        f.write(file_content)
+    splitter = CharacterTextSplitter.from_tiktoken_encoder(
+        separator="\n",
+        chunk_size=600,
+        chunk_overlap=100,
+    )
+    loader = UnstructuredFileLoader(file_path)
+    docs = loader.load_and_split(text_splitter=splitter)
+    return docs
+@st.cache_data(show_spinner="Making quiz...")
+def run_quiz_chain(_docs, topic):
     chain = {"context": questions_chain} | formatting_chain | output_parser
-    response = chain.invoke(_docs)
-    
-    if not response or 'questions' not in response:
-        st.error("No questions were generated. Please check the input data or configuration.")
-        return {'questions': []}
-    
-    return response
-    
-
-@st.cache_data(show_spinner="Searching Wikipedia....")
-def wiki_search(term, difficulty):
+    return chain.invoke(_docs)
+@st.cache_data(show_spinner="Searching Wikipedia...")
+def wiki_search(term):
     retriever = WikipediaRetriever(top_k_results=5)
-    docs = retriever.get_relevant_documents(term) 
-    return docs[:difficulty_levels[difficulty] // 100]
-
+    docs = retriever.get_relevant_documents(term)
+    return docs
 with st.sidebar:
     docs = None
-    difficulty = st.selectbox("Select difficulty", ["Easy", "Medium", "Hard"])
-    choice = st.selectbox("Choose what you want to use.", ("File", "Wikipedia Article",))
-
+    topic = None
+    choice = st.selectbox(
+        "Choose what you want to use.",
+        (
+            "File",
+            "Wikipedia Article",
+        ),
+    )
     if choice == "File":
-        file = st.file_uploader("Upload a .docx , .txt or .pdf file", type=["pdf", "txt", "docx"])
+        file = st.file_uploader(
+            "Upload a .docx , .txt or .pdf file",
+            type=["pdf", "txt", "docx"],
+        )
         if file:
-            docs = split_file(file, difficulty)
+            docs = split_file(file)
     else:
-        topic = st.text_input("Search Wikipedia....")
+        topic = st.text_input("Search Wikipedia...")
         if topic:
-            docs = wiki_search(topic, difficulty)
-
+            docs = wiki_search(topic)
 if not docs:
-    st.markdown("""
-        Welcome to QuizGPT.
+    st.markdown(
+        """
+    Welcome to QuizGPT.
                 
-        I will make a quiz from Wikipedia articles or files you upload to test your knowledge and help you study.
+    I will make a quiz from Wikipedia articles or files you upload to test your knowledge and help you study.
                 
-        Get started by uploading a file or searching on Wikipedia in the sidebar.
-    """)
+    Get started by uploading a file or searching on Wikipedia in the sidebar.
+    """
+    )
 else:
-    response = run_quiz_chain(docs, difficulty, topic if topic else file.name)
-    # 'questions' 키에 대한 확인은 run_quiz_chain 내부에서 처리
+    response = run_quiz_chain(docs, topic if topic else file.name)
     with st.form("questions_form"):
+        st.write(response)
         for question in response["questions"]:
             st.write(question["question"])
-            value = st.radio("Select an option", [answer["answer"] for answer in question["answers"]])
+            value = st.radio(
+                "Select an option.",
+                [answer["answer"] for answer in question["answers"]],
+                index=None,
+            )
             if {"answer": value, "correct": True} in question["answers"]:
                 st.success("Correct!")
             elif value is not None:
